@@ -133,25 +133,51 @@ class MoAStructureIncreasedKeyDropGraphAttention(MessagePassing):
 
         return topk_vals, topk_I, k
 
-
     def forward(self,
-                x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                edge_index: torch.Tensor,
-                edge_attr: Optional[torch.Tensor] = None,
-                att_mask= None,
-                raw_attr = None) -> torch.Tensor:
+                x,
+                edge_index,
+                edge_attr=None,
+                att_mask=None,
+                raw_attr=None,
+                return_attention: bool = False,
+                detach_attention: bool = True):
+
         if self.if_self_attention:
             x_src = x_dst = self.mha_prenorm_src(x)
         else:
             x_src, x_dst = x
             x_src = self.mha_prenorm_src(x_src)
             x_dst = self.mha_prenorm_dst(x_dst)
+
         if self.has_edge_attr:
             edge_attr = self.mha_prenorm_edge(edge_attr)
 
-        x_dst = x_dst + self._mha_layer(x_src, x_dst, edge_index, edge_attr,att_mask,raw_attr)
+        if return_attention:
+            # 临时开关/缓存（不进 state_dict）
+            self._return_attention = True
+            self._cached_attn_combined = None
+
+        x_dst = x_dst + self._mha_layer(x_src, x_dst, edge_index, edge_attr, att_mask, raw_attr)
         x_dst = x_dst + self._ffn_layer(self.ffn_prenorm(x_dst))
-        return x_dst
+
+        if not return_attention:
+            return x_dst
+
+        attn = getattr(self, "_cached_attn_combined", None)
+        if attn is None:
+            # 兜底：正常不该发生
+            attn = torch.empty((edge_index.size(1), self.num_heads), device=edge_index.device)
+
+        if detach_attention:
+            attn = attn.detach()
+
+        # 清理临时字段
+        if hasattr(self, "_return_attention"):
+            del self._return_attention
+        if hasattr(self, "_cached_attn_combined"):
+            del self._cached_attn_combined
+
+        return x_dst, attn
 
     def message(self,
                 x_dst_i: torch.Tensor,
@@ -159,70 +185,110 @@ class MoAStructureIncreasedKeyDropGraphAttention(MessagePassing):
                 edge_attr: Optional[torch.Tensor],
                 index: torch.Tensor,
                 ptr: Optional[torch.Tensor],
-                att_mask,raw_attr) -> torch.Tensor:
-        query_i = self.q(x_dst_i).view(-1, self.num_heads, self.head_dim)
-        key_j = self.k(x_src_j).view(-1, self.num_heads, self.head_dim)
-        value_j = self.v(x_src_j).view(-1, self.num_heads, self.head_dim)
+                att_mask, raw_attr) -> torch.Tensor:
+
+        # ---------------- dense branch ----------------
+        query_i = self.q(x_dst_i).view(-1, self.num_heads, self.head_dim)  # [E, H, D]
+        key_j = self.k(x_src_j).view(-1, self.num_heads, self.head_dim)  # [E, H, D]
+        value_j = self.v(x_src_j).view(-1, self.num_heads, self.head_dim)  # [E, H, D]
+
         if self.has_edge_attr:
             key_j = key_j + self.edge_k(edge_attr).view(-1, self.num_heads, self.head_dim)
             value_j = value_j + self.edge_v(edge_attr).view(-1, self.num_heads, self.head_dim)
-        scale = self.head_dim ** 0.5
-        weight = (query_i * key_j).sum(dim=-1) / scale
 
+        scale = self.head_dim ** 0.5
+        weight = (query_i * key_j).sum(dim=-1) / scale  # [E, H] logits
+
+        # structured keydrop（仅训练时生效；eval() 时不会进来）
         if self.training:
-            # m_r = torch.ones_like(weight) * self.mask_ratio
-            #
             edge_mask = self._structured_keydrop_mask(
                 weight=weight,
                 raw_attr=raw_attr
             )
-            #weight = weight + torch.bernoulli(m_r) * (-1e-12)
             mask = edge_mask.to(torch.bool)
             neg = torch.finfo(weight.dtype).min
             weight = weight.masked_fill(mask, neg)
 
+        # softmax over dst-groups + dropout（这份就是 dense 真正用于加权的 attention）
+        weight = softmax(weight, index, ptr)  # [E, H]
+        weight = self.attn_drop(weight)  # [E, H]
+        att_dense = (value_j * weight.unsqueeze(-1)).view(-1, self.num_heads * self.head_dim)  # [E, H*D]
 
-        weight = softmax(weight, index, ptr)
-        weight = self.attn_drop(weight)
-        att_dense = (value_j * weight.unsqueeze(-1)).view(-1, self.num_heads*self.head_dim)
+        # ---------------- sparse branch (MoA) ----------------
+        # router: select edges for each expert(head)
+        topk_vals, topk_I, k = self.get_topk(x_dst_i)  # topk_vals:[H,k], topk_I:[H,k]
 
-        topk_vals, topk_I, k = self.get_topk(x_dst_i)
-        query_i_new = self.Q(x_dst_i, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)
-        key_j_new = self.K(x_src_j, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)
-        value_j_new = self.V(x_src_j, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)
+        # expert gathered projections
+        query_i_new = self.Q(x_dst_i, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)  # [H,k,H,D]
+        key_j_new = self.K(x_src_j, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)  # [H,k,H,D]
+        value_j_new = self.V(x_src_j, topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)  # [H,k,H,D]
+
         if self.has_edge_attr:
-            key_j_new = key_j_new + self.edge_K(edge_attr,topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)
-            value_j_new = value_j_new + self.edge_V(edge_attr,topk_I).view(self.num_heads, -1, self.num_heads, self.head_dim)
+            key_j_new = key_j_new + self.edge_K(edge_attr, topk_I).view(self.num_heads, -1, self.num_heads,
+                                                                        self.head_dim)
+            value_j_new = value_j_new + self.edge_V(edge_attr, topk_I).view(self.num_heads, -1, self.num_heads,
+                                                                            self.head_dim)
 
-        new_weight = (query_i_new * key_j_new).sum(dim=-1) / scale
-        new_index = index[topk_I]
+        # sparse attention logits and softmax (grouped by dst index of selected edges)
+        new_weight = (query_i_new * key_j_new).sum(dim=-1) / scale  # [H,k,H]
+        new_index = index[topk_I]  # [H,k] (dst ids for selected edges)
+
         new_weights_list = []
         for c in range(self.num_heads):
-            idx_h = new_index[c]
-            w_h = softmax(new_weight[c], idx_h, ptr=None)
+            idx_h = new_index[c]  # [k]
+            w_h = softmax(new_weight[c], idx_h, ptr=None)  # [k,H]
             new_weights_list.append(w_h)
-        new_weight = torch.stack(new_weights_list, dim=0)
-        new_weight = self.attn_drop(new_weight)
 
-        att = value_j_new * new_weight.unsqueeze(-1)
-        att = att * topk_vals.unsqueeze(-1).unsqueeze(-1)  # [H, k, H, D]
-        att_flat = att.reshape(-1, k, 128)
-        num_edges = value_j.shape[0]  # 134342
+        new_weight = torch.stack(new_weights_list, dim=0)  # [H,k,H]
+        new_weight = self.attn_drop(new_weight)  # [H,k,H]
+
+        # sparse message build (original code path)
+        att = value_j_new * new_weight.unsqueeze(-1)  # [H,k,H,D]
+        att = att * topk_vals.unsqueeze(-1).unsqueeze(-1)  # [H,k,H,D]
+
+        # NOTE: 这里你原代码硬编码 128（= H*D）；保持不动
+        att_flat = att.reshape(-1, k, 128)  # [H,k,128]
+
+        num_edges = value_j.shape[0]  # E
         out_flat = torch.zeros((num_edges, 128),
                                device=value_j_new.device,
                                dtype=value_j_new.dtype)
-        for c in range(self.num_heads):
-            idx = topk_I[c].contiguous()  # [k]
-            # out_flat.index_add_(0, idx, att_flat[c])
 
+        for c in range(self.num_heads):
+            idx = topk_I[c].contiguous()  # [k] edge indices
             with torch.cuda.amp.autocast(enabled=False):
                 of = out_flat.float()
                 src = att_flat[c].float()
                 of.index_add_(0, idx, src)
             out_flat = of.to(out_flat.dtype)
-        cogate_feature = self.cogate_feature_extractor(edge_attr)
 
-        return cogate_feature * out_flat +  att_dense
+        cogate_feature = self.cogate_feature_extractor(edge_attr)  # [E,1]
+
+        # ---------------- cache dense+sparse combined attention ----------------
+        # 目标：输出一个 [E,H] 的 “effective attention strength”
+        # dense: weight (already softmax+dropout) -> [E,H]
+        # sparse_eff: 把 (new_weight * topk_vals * gate) 聚合回 [E,H]
+        if getattr(self, "_return_attention", False):
+            E, H = weight.shape
+            gate = cogate_feature.squeeze(-1)  # [E]
+
+            sparse_eff = torch.zeros((E, H), device=weight.device, dtype=weight.dtype)  # [E,H]
+            for c in range(self.num_heads):
+                idx = topk_I[c].contiguous()  # [k]
+                contrib = new_weight[c] * topk_vals[c].unsqueeze(-1)  # [k,H]
+                contrib = contrib * gate[idx].unsqueeze(-1)  # [k,H]
+
+                # 与你上面 out_flat 的做法一致：用 float32 做 index_add 更稳
+                with torch.cuda.amp.autocast(enabled=False):
+                    se = sparse_eff.float()
+                    se.index_add_(0, idx, contrib.float())
+                sparse_eff = se.to(sparse_eff.dtype)
+
+            attn_combined_eff = weight + sparse_eff  # [E,H]
+            self._cached_attn_combined = attn_combined_eff  # cache for forward()
+
+        # ---------------- final message ----------------
+        return cogate_feature * out_flat + att_dense
 
     def _mha_layer(self,
                    x_src: torch.Tensor,

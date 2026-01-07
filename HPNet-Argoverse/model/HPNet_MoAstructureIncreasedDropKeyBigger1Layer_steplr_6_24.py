@@ -100,7 +100,7 @@ class HPNet_MoAStructureIncreasedDropKeyBigger1Layer_StepLR_6_24(pl.LightningMod
         return pred
 
     def training_step(self, data, batch_idx):
-        traj_propose, traj_output, prob_output = self(
+        traj_propose, traj_output, prob_output,t2m_att,l2m_att,_,_ = self(
             data)  # [(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K]
         target_traj, target_mask = generate_target(position=data['agent']['position'],
                                                    mask=data['agent']['visible_mask'],
@@ -140,8 +140,16 @@ class HPNet_MoAStructureIncreasedDropKeyBigger1Layer_StepLR_6_24(pl.LightningMod
         return loss
 
     def validation_step(self, data, batch_idx):
-        traj_propose, traj_output, prob_output = self(
+        traj_propose, traj_output, prob_output,t2m_att,l2m_att,_,_ = self(
             data)  # [(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K]
+        if batch_idx == 1000:
+            return
+        att_dict ={
+            "t2m_att":t2m_att,
+            "l2m_att":l2m_att,
+        }
+        torch.save(att_dict, str(batch_idx)+"_SpaMoA" + ".pt")#[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K]
+
         target_traj, target_mask = generate_target(position=data['agent']['position'],
                                                    mask=data['agent']['visible_mask'],
                                                    num_historical_steps=self.num_historical_steps,

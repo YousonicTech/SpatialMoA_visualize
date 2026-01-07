@@ -228,12 +228,12 @@ class Backbone_MoAStructureIncreasedDropKey_Bigger1layer_6_24(nn.Module):
         # ALL ATTENTION
         # t2m attention
         t_embs = a_embs.reshape(-1, self.hidden_dim)  # [(N1,...,Nb)*H,D]
-        m_embs_t = self.t2m_attn_layer(x=[t_embs, m_embs], edge_index=t2m_edge_index, edge_attr=t2m_edge_attr_embs,
-                                       att_mask=to_mask,raw_attr=t2m_edge_attr_input)  # [(N1,...,Nb)*H*K,D]
+        m_embs_t,t2m_att = self.t2m_attn_layer(x=[t_embs, m_embs], edge_index=t2m_edge_index, edge_attr=t2m_edge_attr_embs,
+                                       att_mask=to_mask,raw_attr=t2m_edge_attr_input,return_attention = True,detach_attention = True)  # [(N1,...,Nb)*H*K,D]
 
         # l2m attention
-        m_embs_l = self.l2m_attn_layer(x=[l_embs, m_embs], edge_index=l2m_edge_index, edge_attr=l2m_edge_attr_embs,
-                                       att_mask=to_mask_l,raw_attr = l2m_edge_attr_input)  # [(N1,...,Nb)*H*K,D]
+        m_embs_l,l2m_att = self.l2m_attn_layer(x=[l_embs, m_embs], edge_index=l2m_edge_index, edge_attr=l2m_edge_attr_embs,
+                                       att_mask=to_mask_l,raw_attr = l2m_edge_attr_input,return_attention = True,detach_attention = True)  # [(N1,...,Nb)*H*K,D]
 
         m_embs = m_embs_t + m_embs_l
         m_embs = m_embs.reshape(num_all_agent, self.num_historical_steps, self.num_modes, self.hidden_dim).transpose(0,
@@ -423,7 +423,7 @@ class Backbone_MoAStructureIncreasedDropKey_Bigger1layer_6_24(nn.Module):
                                                                  self.num_modes)  # [(N1,...,Nb),H,K]
         prob_output = self.prob_norm(prob_output)  # [(N1,...,Nb),H,K]
 
-        return traj_propose, traj_output, prob_output  # [(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K]
+        return traj_propose, traj_output, prob_output,t2m_att,l2m_att,None,None  # [(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K,F,2],[(N1,...,Nb),H,K]
 
 
 if __name__ == "__main__":

@@ -151,7 +151,10 @@ class GraphAttentionAdaptiveMoSAAttGate(MessagePassing):
     def forward(self,
                 x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                 edge_index: torch.Tensor,
-                edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+                edge_attr: Optional[torch.Tensor] = None,
+                return_attention: bool = False,
+                detach_attention: bool = True,
+                ) -> torch.Tensor:
 
         if self.if_self_attention:
             x_src = x_dst = self.mha_prenorm_src(x)
@@ -162,9 +165,32 @@ class GraphAttentionAdaptiveMoSAAttGate(MessagePassing):
         if self.has_edge_attr:
             edge_attr = self.mha_prenorm_edge(edge_attr)
 
+        if return_attention:
+            # 临时开关与缓存（不在 __init__ 里定义）
+            self._return_attention = True
+            self._cached_attention = None
+
         x_dst = x_dst + self._mha_layer(x_src, x_dst, edge_index, edge_attr)
         x_dst = x_dst + self._ffn_layer(self.ffn_prenorm(x_dst))
-        return x_dst,None
+
+        if not return_attention:
+            return x_dst
+
+        attn = getattr(self, "_cached_attention", None)
+        if attn is None:
+            # 兜底：正常不会发生
+            attn = torch.empty((edge_index.size(1), self.num_heads), device=edge_index.device)
+
+        if detach_attention:
+            attn = attn.detach()
+
+        # 清理临时字段，尽量不“污染”对象
+        if hasattr(self, "_return_attention"):
+            del self._return_attention
+        if hasattr(self, "_cached_attention"):
+            del self._cached_attention
+
+        return x_dst, attn
 
     def message(self,
                 x_dst_i: torch.Tensor,
@@ -227,6 +253,9 @@ class GraphAttentionAdaptiveMoSAAttGate(MessagePassing):
         # return (value_j * weight.unsqueeze(-1)).view(-1, self.num_heads*self.head_dim)
 
         cogate_feature = self.cogate_feature_extractor(edge_attr)
+        if getattr(self, "_return_attention", False):
+            self._cached_attention = weight
+
         return cogate_feature * out_flat + (1-cogate_feature) * att_dense
     def _mha_layer(self,
                    x_src: torch.Tensor,
