@@ -172,10 +172,10 @@ class Backbone(nn.Module):
         #ALL ATTENTION
         #t2m attention
         t_embs = a_embs.reshape(-1, self.hidden_dim)  #[(N1,...,Nb)*H,D]
-        m_embs_t,t2m_att = self.t2m_attn_layer(x = [t_embs, m_embs], edge_index = t2m_edge_index, edge_attr = t2m_edge_attr_embs)         #[(N1,...,Nb)*H*K,D]
+        m_embs_t,t2m_att = self.t2m_attn_layer(x = [t_embs, m_embs], edge_index = t2m_edge_index, edge_attr = t2m_edge_attr_embs,return_attention = True,detach_attention = True)         #[(N1,...,Nb)*H*K,D]
 
         #l2m attention
-        m_embs_l,l2m_att = self.l2m_attn_layer(x = [l_embs, m_embs], edge_index = l2m_edge_index, edge_attr = l2m_edge_attr_embs)         #[(N1,...,Nb)*H*K,D]
+        m_embs_l,l2m_att = self.l2m_attn_layer(x = [l_embs, m_embs], edge_index = l2m_edge_index, edge_attr = l2m_edge_attr_embs,return_attention = True,detach_attention = True)         #[(N1,...,Nb)*H*K,D]
         
         m_embs = m_embs_t + m_embs_l
         m_embs = m_embs.reshape(num_all_agent, self.num_historical_steps, self.num_modes, self.hidden_dim).transpose(0,1).reshape(-1,self.hidden_dim)       #[H*(N1,...,Nb)*K,D]
@@ -292,10 +292,10 @@ class Backbone(nn.Module):
 
         #t2n attention
         t_embs = a_embs.reshape(-1, self.hidden_dim)  #[(N1,...,Nb)*H,D]
-        n_embs_t,t2n_att = self.t2n_attn_layer(x = [t_embs, n_embs], edge_index = t2n_edge_index, edge_attr = t2n_edge_attr_embs)         #[(N1,...,Nb)*H*K,D]
+        n_embs_t,t2n_att = self.t2n_attn_layer(x = [t_embs, n_embs], edge_index = t2n_edge_index, edge_attr = t2n_edge_attr_embs,return_attention = True,detach_attention = True)         #[(N1,...,Nb)*H*K,D]
 
         #l2m attention
-        n_embs_l,l2n_att = self.l2n_attn_layer(x = [l_embs, n_embs], edge_index = l2n_edge_index, edge_attr = l2n_edge_attr_embs)         #[(N1,...,Nb)*H*K,D]
+        n_embs_l,l2n_att = self.l2n_attn_layer(x = [l_embs, n_embs], edge_index = l2n_edge_index, edge_attr = l2n_edge_attr_embs,return_attention = True,detach_attention = True)         #[(N1,...,Nb)*H*K,D]
 
         n_embs = n_embs_t + n_embs_l
         n_embs = n_embs.reshape(num_all_agent, self.num_historical_steps, self.num_modes, self.hidden_dim).transpose(0,1).reshape(-1,self.hidden_dim)       #[H*(N1,...,Nb)*K,D]
